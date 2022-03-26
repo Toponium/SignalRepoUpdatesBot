@@ -1,0 +1,195 @@
+REPO=https://api.github.com/repos/signalapp/Signal-Android
+BRANCH=master
+TAGS_URL="$REPO/tags?sha=$BRANCH"
+COMMITS_URL="$REPO/commits?sha=$BRANCH&per_page=100"
+COMPARE_URL=https://github.com/signalapp/Signal-Android/compare
+FORUM_URL=https://community.signalusers.org
+FAD_THREAD_URL="$FORUM_URL/t/17538"
+
+api_key_file=api_key
+tags_file=tags
+commits_file=commits
+topic_file=topic_id
+prev_post_number_file=prev_post_number
+posted_version_file=posted_version
+
+#Fill in values from test category or direct message
+test_topic_id=
+test_prev_post_number=
+test_posted_version=
+
+#Github is checked with this interval.
+poll_interval=30
+#If a beta feedback thread hasn't been created the bot will sleep for this interval.
+beta_thread_poll_interval=300
+
+is_int () { test "$@" -eq "$@" 2>/dev/null && [ "$@" -gt 0 ]; }
+is_version () { [[ "$@" =~ ^v[1-9].([0-9]|[1-9][0-9]).([0-9]|[1-9][0-9])$ ]]; }
+
+echo_sleep () { echo "Sleeping for $@ seconds." && sleep "$@"; }
+
+sleep_until () {
+	time_now=$(date +%s)
+
+	if [ -z "$reset" ]; then
+		echo "Rate limit has been exceeded but when rate limit will be reset is unknown. Sleeping for one hour." && sleep 3600
+	elif [ "$reset" -lt "$time_now" ]; then
+		echo "Rate limit has been exceeded but was supposed to be reset at $(date -d "@$reset"). Sleeping for 10 minutes." && sleep 600
+	elif [ "$((reset-time_now))" -gt 3600 ]; then
+		echo "Rate limit has been exceeded and it will supposedly be reset at $(date -d "@$reset"). Sleeping for one hour and trying again." && sleep 3600	
+	else
+		echo "Rate limit exceeded. Sleeping until $(date -d "@$reset")." && sleep $((reset-time_now))
+	fi
+}
+
+[ -z "$(jq --version|grep jq-1.6)" ] && echo "jq version 1.6 is needed. Exiting." && exit
+
+[ -f "$api_key_file" ] && user_api_key=$(< "$api_key_file") || { echo "User Api Key is missing. Exiting." && exit; }
+
+[ -f "$topic_file" ] && topic_id=$(< "$topic_file") || topic_id="$test_topic_id"
+[ -f "$prev_post_number_file" ] && prev_post_number=$(< "$prev_post_number_file") || prev_post_number="$test_prev_post_number"
+[ -f "$posted_version_file" ] && posted_version=$(< "$posted_version_file") || posted_version="$test_posted_version"
+
+[ -z "$topic_id" -o -z "$prev_post_number" -o -z "$posted_version" ] && echo "Previous state is unknown. Exiting." && exit
+
+! is_int "$topic_id" || ! is_int "$prev_post_number" || ! is_version "$posted_version" && { echo "Previous state is garbage. Exiting." && exit; }
+
+echo "Previous post was at $FORUM_URL/t/$topic_id/$prev_post_number for $posted_version."
+
+#TODO: Check that the url actually has commits for posted version, verifying accuracy of previous state.
+
+IFS=. read -r -a  posted_version_split<<<"${posted_version/v/}"
+beta_topic_id=$(curl -s "$FORUM_URL/t/beta-feedback-for-the-upcoming-android-${posted_version_split[0]}-${posted_version_split[1]}-release"|grep redirected|sed 's;.*release/\([1-9][0-9]*\).*;\1;')
+
+[ -z "$beta_topic_id" ] && echo "Beta feedback thread for posted version does not exist. Exiting." && exit
+
+echo "Beta thread for $posted_version can be found at $FORUM_URL/t/$beta_topic_id"
+
+#TODO: Check that the url is indeed correct.
+#TODO: Post to the beta feedback thread instead of the test thread.
+
+while true; do
+	echo "Fetching tags from Github..."
+
+	[ -f "$tags_file" ] && etag=$(grep -m1 etag "$tags_file"|cut -d'"' -f2|sed s/[^0-9abcdef]//) || etag=""
+
+	header_size_tags_query=$(curl -s -i -H"If-None-Match: \"$etag\"" -w "%{size_header}" -o "$tags_file" "$TAGS_URL")
+
+	requests_remaining=$(grep x-ratelimit-remaining "$tags_file"|sed 's/[^0-9]//g')
+	if [ -z "$requests_remaining" ] || [ "$requests_remaining" -eq 0 ]; then
+		reset=$(grep x-ratelimit-reset "$tags_file"|sed 's/[^0-9]//g')
+		sleep_until && continue
+	fi
+
+	echo "Fetched tags successfully. $requests_remaining API requests remaining."
+
+	if [ -n "$(grep "HTTP/2 304" "$tags_file")" ]; then
+		echo "There are no new tags." && echo_sleep "$poll_interval" && continue
+	elif [ -z "$(grep "HTTP/2 200" "$tags_file")" ]; then
+		echo "Something unexpected happened while fetching tags:"
+		cat "$tags_file"
+		echo "Removing etag line to force fetching of new tags file..."
+		sed -i 's/.*etag.*//' "$tags_file"
+		echo_sleep "$poll_interval" && continue
+	fi
+
+	echo "Checking for new tags..."
+	tags=($(tail -c +$((header_size_tags_query+1)) "$tags_file"|jq -r .[].name))
+
+	if [ -z "$tags" -o "$tags" = null ] || ! is_version "${tags[0]}"; then
+		echo "Something unexpected happened while checking for new tags:"
+		cat "$tags_file"
+		echo "Removing etag line to force fetching of new tags file..."
+		sed -i 's/.*etag.*//' "$tags_file"
+		echo_sleep "$poll_interval" && continue
+	fi
+
+	new_version=${tags[0]}
+
+	if [ "$new_version" == "$posted_version" ]; then
+		echo "Latest version remains at last posted version: $posted_version" && echo_sleep "$poll_interval" && continue
+	fi	
+
+#TODO: Check if backported tags can create problems
+	echo "$new_version has been pushed to Github."
+
+	IFS=. read -r -a new_version_split<<<"${new_version/v/}"
+
+	if [ "${new_version_split[2]}" -eq 0 ]; then
+		echo "Checking forum for beta feedback thread..."
+		beta_topic_id=""; while [ -z "$beta_topic_id" ]; do
+			beta_topic_id=$(curl -s "$FORUM_URL/t/beta-feedback-for-the-upcoming-android-${new_version_split[0]}-${new_version_split[1]}-release"|grep redirected|sed 's;.*release/\([0-9]*\).*;\1;')
+			[ -z "$beta_topic_id" ] && echo "Beta feedback thread has not yet been created." && echo_sleep "$beta_thread_poll_interval"
+		done
+
+		echo "New beta feedback thread can be found at $FORUM_URL/t/$beta_topic_id"
+
+#TODO: Switch to posting to the new beta feedback thread.
+#TODO: Either do not post commits for .0 versions or post them under a details tag as needed.
+		prev_post_number=1
+		echo "$prev_post_number" > "$prev_post_number_file"
+	fi
+
+	echo "Fetching commits from Github to create the forum post..."
+	header_size_commits_query=$(curl -s -i -o "$commits_file" -w "%{size_header}" "$COMMITS_URL")
+	requests_remaining=$(grep x-ratelimit-remaining "$tags_file"|sed 's/[^0-9]//g')
+	if [ -z "$requests_remaining" ] || [ "$requests_remaining" -eq 0 ]; then
+		reset=$(grep x-ratelimit-reset "$tags_file"|sed 's/[^0-9]//g')
+		sleep_until && continue
+	fi
+
+	echo "Fetched commits successfully. $requests_remaining API requests remaining. Creating the post..."
+	echo "----------------------------------------BEGIN_POST----------------------------------------"
+
+	cat <<- EOF >"post_for_$new_version"
+		## :tada: - New Version: $new_version
+		Available via [Firebase App Distribution]($FAD_THREAD_URL)
+		[quote]
+		All new commits since $posted_version:
+	EOF
+
+#TODO: Use commit sha and download more pages as needed to handle the case where none of the commits match "Bump version to $posted_version"
+	tail -c +$((header_size_commits_query+1)) "$commits_file" |\
+	jq  --arg posted_version "${posted_version/v/}" '.[] |
+		if .commit.message|test("Bump version to "+$posted_version) then halt
+		else "* "+.commit.message+" [[link_placeholder]]("+.html_url+")" end' |\
+	tac | awk '{gsub("link_placeholder",NR,$0);print}' |\
+	sed -e 's/\\n\(\\n\)*Co-Authored-By.*<.*>//I' |\
+	sed -e 's/^"//' -e 's/\\n\(\\n\)*/\n/g' -e 's/"$/\n/' >> "post_for_$new_version"
+
+	cat <<- EOF >>"post_for_$new_version"
+		---
+		Gathered from [signalapp/Signal-Android]($COMPARE_URL/$posted_version...$new_version)
+		[/quote]
+	EOF
+
+	cat "post_for_$new_version"
+	echo "----------------------------------------END_POST----------------------------------------"
+	echo "Posting as a reply to $FORUM_URL/t/$topic_id/$prev_post_number ..."
+
+#TODO: Check if anyone else has posted the commits already
+#TODO: Remove need for manual review
+	read -p "Press enter key to continue posting above contents:"
+				
+	curl -s -i -o "response_to_post_for_$new_version" \
+		-X POST "$FORUM_URL/posts.json" \
+		-H "User-Api-Key: $user_api_key" \
+		-F "topic_id=$topic_id" \
+		-F "reply_to_post_number=$prev_post_number" \
+		-F "raw=$(< "post_for_$new_version")"
+	post_number=$(tail -n1 "response_to_post_for_$new_version"|jq .post_number?)
+
+	if [ -z "$post_number" -o "$post_number" == "null" ] || ! is_int $post_number; then
+		echo "Something went wrong. Cleaning up to ensure retry. Error message is below:"
+		tail -n1 "response_to_post_for_$new_version"|jq
+		rm "$tags_file" "$commits_file"
+	else
+		echo "Successfully posted to $FORUM_URL/t/$topic_id/$post_number"
+#TODO: Check that the post indeed has the right contents
+		prev_post_number="$post_number"
+		echo "$prev_post_number" > "$prev_post_number_file"
+		posted_version="$new_version"
+		echo "$posted_version" > "$posted_version_file"
+	fi
+	echo_sleep "$poll_interval"
+done
